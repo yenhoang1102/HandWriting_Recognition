@@ -1,0 +1,254 @@
+import os
+import warnings
+
+# Silence TensorFlow C++ logs
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+# Disable XLA duplication logs
+os.environ["XLA_FLAGS"] = "--xla_gpu_cuda_data_dir=/usr/local/cuda"
+
+warnings.filterwarnings("ignore")
+
+
+import numpy as np
+import pandas as pd
+import os
+import random
+import cv2
+import imutils
+import random
+import matplotlib.pyplot as plt
+import keras
+import keras.layers as L
+import keras.models as M
+import tensorflow as tf
+from PIL import Image
+import os
+import matplotlib.pyplot as plt
+from keras.utils import Sequence
+from jiwer import wer, cer
+from tensorflow.keras import backend as K
+img_size = 64
+BATCH_SIZE = 8
+EPOCHS = 10
+
+import zipfile
+local_zip = "C:\\Users\\Yen's PC\\Downloads\\Handwriting Recognition.zip"
+zip_ref = zipfile.ZipFile(local_zip, 'r')
+zip_ref.extractall(r"C:\Users\Yen's PC\Downloads\Handwriting Recognition")
+zip_ref.close()
+
+train = pd.read_csv(r"C:\Users\Yen's PC\Downloads\Handwriting Recognition\written_name_train_v2.csv")
+val = pd.read_csv(r"C:\Users\Yen's PC\Downloads\Handwriting Recognition\written_name_validation_v2.csv")
+
+train.dropna(inplace=True)
+train['Length']=train['IDENTITY'].apply(lambda x : len(str(x)))
+train=train[train['Length']<=21]
+train['IDENTITY']=train['IDENTITY'].str.upper()
+train[train['Length']==max(train['Length'])]
+train=train.sample(frac=0.8,random_state=42)
+val=val.sample(frac=0.1)
+
+characters = set()
+train['IDENTITY'] = train['IDENTITY'].apply(lambda x: str(x))
+for name in train['IDENTITY'].values:
+    for char in name:
+        if char not in characters:
+            characters.add(char)
+characters = sorted(list(characters))
+
+char_to_label = {char: idx for idx, char in enumerate(characters)}
+label_to_char = {idx: char for idx, char in enumerate(characters)}
+
+path_train = r"C:\Users\Yen's PC\Downloads\Handwriting Recognition\train_v2\train"
+path_val = r"C:\Users\Yen's PC\Downloads\Handwriting Recognition\validation_v2\validation"
+
+# Data Generator
+class DataGenerator(Sequence):
+    def __init__(self,dataframe,path,char_map,batch_size=128,img_size=(256,64),
+                 downsample_factor=4,max_length=22,shuffle=True):
+        self.dataframe=dataframe
+        self.path=path
+        self.char_map=char_map
+        self.batch_size=batch_size
+        self.width=img_size[0]
+        self.height=img_size[1]
+        self.downsample_factor=downsample_factor
+        self.max_length=max_length
+        self.shuffle=shuffle
+        self.indices = np.arange(len(dataframe))
+        self.on_epoch_end()
+        
+    def __len__(self):
+        return len(self.dataframe)//self.batch_size
+    def __getitem__(self,idx):
+        curr_batch_idx=self.indices[idx*self.batch_size:(idx+1)*self.batch_size]
+        batch_images=np.ones((self.batch_size,self.width,self.height,1),dtype=np.float32)
+        batch_labels=np.ones((self.batch_size,self.max_length),dtype=np.float32)
+        input_length=np.ones((self.batch_size,1),dtype=np.float32)*(self.width//self.downsample_factor-2)
+        label_length=np.zeros((self.batch_size,1),dtype=np.int64)
+        
+        for i,idx in enumerate(curr_batch_idx):
+            img_path=self.dataframe['FILENAME'].values[idx]
+            img=cv2.imread(self.path+'/'+img_path)
+            img=cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            img=cv2.resize(img,(self.width,self.height))
+            img=(img/255).astype(np.float32)
+            img=img.T
+            img=np.expand_dims(img,axis=-1)
+            text=self.dataframe['IDENTITY'].values[idx]
+            text=str(text)
+            label=[]
+            for j in text: 
+                if j in self.char_map :
+                    label.append(self.char_map[j])
+                else:
+                    label.append(100)
+            label.extend([100]*(22-len(label)))
+            batch_images[i]=img
+            batch_labels[i]=label
+            label_length[i]=len(label)
+        batch_inputs= {
+                'input_data':batch_images,
+                'input_label':batch_labels,
+                'input_length':input_length,
+                'label_length':label_length
+        }
+        
+        return batch_inputs,np.zeros((self.batch_size),dtype=np.float32)
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+train_generator=DataGenerator(train,path_train,char_to_label,batch_size=BATCH_SIZE,img_size=(256,64))
+val_generator=DataGenerator(val,path_val,char_to_label,batch_size=BATCH_SIZE,img_size=(256,64))
+
+class CTCLayer(L.Layer):
+    def __init__(self, name=None):
+        super().__init__(name=name)
+        self.loss_fn = tf.keras.backend.ctc_batch_cost
+
+    def call(self, y_true, y_pred, input_length, label_length):
+        # Compute the training-time loss value and add it
+        # to the layer using `self.add_loss()`.
+        loss = self.loss_fn(y_true, y_pred, input_length, label_length)
+        self.add_loss(loss)
+        
+        # On test time, just return the computed loss
+        return loss
+    
+def make_model():
+    inp=L.Input(shape=(256,64,1),dtype=np.float32,name='input_data')
+    labels=L.Input(shape=[22],dtype=np.float32,name='input_label')
+    input_length=L.Input(shape=[1],dtype=np.int64,name='input_length')
+    label_length=L.Input(shape=[1],dtype=np.int64,name='label_length')
+    x=L.Conv2D(64,(3,3),activation='relu',padding='same',kernel_initializer='he_normal')(inp)
+    x=L.MaxPooling2D(pool_size=(2,2))(x)
+    x=L.Dropout(0.3)(x)
+    x=L.Conv2D(128,(3,3),activation='relu',padding='same',kernel_initializer='he_normal')(x)
+    x=L.MaxPooling2D(pool_size=(2,2))(x)
+    x=L.Dropout(0.3)(x)
+    new_shape=((256//4),(64//4)*128)
+    x=L.Reshape(new_shape)(x)
+    x=L.Dense(64,activation='relu')(x)
+    x=L.Dropout(0.2)(x)
+    x=L.Bidirectional(L.LSTM(128,return_sequences=True,dropout=0.2))(x)
+    x=L.Bidirectional(L.LSTM(64,return_sequences=True,dropout=0.25))(x)
+    x=L.Dense(len(characters)+1,activation='softmax',kernel_initializer='he_normal',name='Dense_output')(x)
+    output=CTCLayer(name='outputs')(labels,x,input_length,label_length)
+    model=M.Model([inp,labels,input_length,label_length],output)
+    # Optimizer
+    sgd = keras.optimizers.SGD(learning_rate=0.002,
+                               decay=1e-6,
+                               momentum=0.9,
+                               nesterov=True,
+                               clipnorm=5)
+    model.compile(optimizer=sgd)
+    return model
+
+model=make_model()
+model.summary()
+
+es = keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+if 'prediction_model_ocr' not in os.listdir('./'):
+    history = model.fit(train_generator,
+                        steps_per_epoch=len(train_generator),
+                        validation_data=val_generator,
+                        epochs=8)
+
+prediction_model = M.Model(model.get_layer.input[0],
+                            model.get_layer(name='Dense_output').output)
+prediction_model.summary()
+
+if 'prediction_model_ocr' not in os.listdir('./'):
+    prediction_model.save('prediction_model_ocr')
+    prediction_model = M.load_model('prediction_model_ocr', compile=False)
+
+label_to_char[100] = ''
+def decode_prediction(pred):
+    input_len = np.ones(pred.shape[0]) * pred.shape[1]
+    results = tf.keras.backend.ctc_decode(pred, input_length=input_len, greedy=True)[0][0]
+    output_text = []
+    for res in results:
+        res = tf.gather_nd(res, tf.where(tf.math.not_equal(res, -1)))
+        res = tf.gather_nd(res, tf.where(tf.math.not_equal(res, 100)))
+        text = ''.join([label_to_char[int(i)] for i in res])
+        output_text.append(text)
+    return output_text
+
+for p, (inp_value, _) in enumerate(val_generator):
+    bs = inp_value['input_data'].shape[0]
+    X_data = inp_value['input_data']
+    labels = inp_value['input_label']
+    plt.imshow(X_data[0].squeeze(), cmap='gray')
+    preds = prediction_model.predict(X_data)
+    pred_texts = decode_prediction(preds)
+    
+    
+    orig_texts = []
+    for label in labels:
+        text = ''.join([label_to_char[int(x)] for x in label])
+        orig_texts.append(text)
+        
+    for i in range(bs):
+        print(f'Ground truth: {orig_texts[i]} \t Predicted: {pred_texts[i]}')
+    break
+
+def calculate_wer(pred_texts, orig_texts):
+    total_wer = 0
+    for pred, orig in zip(pred_texts, orig_texts):
+        total_wer += wer(orig, pred)
+    return total_wer / len(pred_texts)
+
+def calculate_cer(pred_texts, orig_texts):
+    total_cer = 0
+    for pred, orig in zip(pred_texts, orig_texts):
+        total_cer += cer(orig, pred)
+    return total_cer / len(pred_texts)
+
+def evaluate_model(prediction_model, val_generator):
+    all_pred_texts = []
+    all_orig_texts = []
+    
+    for inp_value, _ in val_generator:
+        X_data = inp_value['input_data']
+        labels = inp_value['input_label']
+        
+        preds = prediction_model.predict(X_data)
+        pred_texts = decode_prediction(preds)
+        
+        orig_texts = []
+        for label in labels:
+            text = ''.join([label_to_char[int(x)] for x in label])
+            orig_texts.append(text)
+        
+        all_pred_texts.extend(pred_texts)
+        all_orig_texts.extend(orig_texts)
+    
+    wer_score = calculate_wer(all_pred_texts, all_orig_texts)
+    cer_score = calculate_cer(all_pred_texts, all_orig_texts)
+    
+    return wer_score, cer_score
+wer_score, cer_score = evaluate_model(prediction_model, val_generator)
+print(f'Word Error Rate (WER): {wer_score:.4f}')
+print(f'Character Error Rate (CER): {cer_score:.4f}')
