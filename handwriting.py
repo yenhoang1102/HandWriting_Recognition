@@ -28,9 +28,9 @@ import matplotlib.pyplot as plt
 from keras.utils import Sequence
 from jiwer import wer, cer
 from tensorflow.keras import backend as K
-img_size = 64
-BATCH_SIZE = 8
-EPOCHS = 10
+img_size = 32
+BATCH_SIZE = 32
+
 
 import zipfile
 local_zip = "C:\\Users\\Yen's PC\\Downloads\\Handwriting Recognition.zip"
@@ -43,11 +43,15 @@ val = pd.read_csv(r"C:\Users\Yen's PC\Downloads\Handwriting Recognition\written_
 
 train.dropna(inplace=True)
 train['Length']=train['IDENTITY'].apply(lambda x : len(str(x)))
-train=train[train['Length']<=21]
+train=train[train['Length']<=16]
 train['IDENTITY']=train['IDENTITY'].str.upper()
 train[train['Length']==max(train['Length'])]
 train=train.sample(frac=0.8,random_state=42)
-val=val.sample(frac=0.1)
+val.dropna(inplace=True)
+val['Length'] = val['IDENTITY'].apply(lambda x: len(str(x)))
+val = val[val['Length'] <= 16]
+val['IDENTITY'] = val['IDENTITY'].str.upper()
+val = val.sample(frac=0.1)
 
 characters = set()
 train['IDENTITY'] = train['IDENTITY'].apply(lambda x: str(x))
@@ -66,7 +70,7 @@ path_val = r"C:\Users\Yen's PC\Downloads\Handwriting Recognition\validation_v2\v
 # Data Generator
 class DataGenerator(Sequence):
     def __init__(self,dataframe,path,char_map,batch_size=128,img_size=(256,64),
-                 downsample_factor=4,max_length=22,shuffle=True):
+                 downsample_factor=4,max_length=16,shuffle=True):
         self.dataframe=dataframe
         self.path=path
         self.char_map=char_map
@@ -99,29 +103,34 @@ class DataGenerator(Sequence):
             text=self.dataframe['IDENTITY'].values[idx]
             text=str(text)
             label=[]
-            for j in text: 
-                if j in self.char_map :
+            for j in text:
+                if j in self.char_map:
                     label.append(self.char_map[j])
                 else:
                     label.append(100)
-            label.extend([100]*(22-len(label)))
-            batch_images[i]=img
-            batch_labels[i]=label
-            label_length[i]=len(label)
+
+            if len(label) > self.max_length:
+                label = label[:self.max_length]
+
+            label_length[i] = len(label)
+
+            label.extend([100]*(self.max_length-len(label)))
+
+            batch_labels[i] = label
+            batch_images[i] = img
         batch_inputs= {
                 'input_data':batch_images,
                 'input_label':batch_labels,
                 'input_length':input_length,
                 'label_length':label_length
         }
-        
         return batch_inputs,np.zeros((self.batch_size),dtype=np.float32)
     def on_epoch_end(self):
         if self.shuffle:
             np.random.shuffle(self.indices)
 
-train_generator=DataGenerator(train,path_train,char_to_label,batch_size=BATCH_SIZE,img_size=(256,64))
-val_generator=DataGenerator(val,path_val,char_to_label,batch_size=BATCH_SIZE,img_size=(256,64))
+train_generator=DataGenerator(train,path_train,char_to_label,batch_size=BATCH_SIZE,img_size=(128,32))
+val_generator=DataGenerator(val,path_val,char_to_label,batch_size=BATCH_SIZE,img_size=(128,32))
 
 class CTCLayer(L.Layer):
     def __init__(self, name=None):
@@ -138,8 +147,8 @@ class CTCLayer(L.Layer):
         return loss
     
 def make_model():
-    inp=L.Input(shape=(256,64,1),dtype=np.float32,name='input_data')
-    labels=L.Input(shape=[22],dtype=np.float32,name='input_label')
+    inp=L.Input(shape=(128,32,1),dtype=np.float32,name='input_data')
+    labels=L.Input(shape=[16],dtype=np.float32,name='input_label')
     input_length=L.Input(shape=[1],dtype=np.int64,name='input_length')
     label_length=L.Input(shape=[1],dtype=np.int64,name='label_length')
     x=L.Conv2D(64,(3,3),activation='relu',padding='same',kernel_initializer='he_normal')(inp)
@@ -148,7 +157,7 @@ def make_model():
     x=L.Conv2D(128,(3,3),activation='relu',padding='same',kernel_initializer='he_normal')(x)
     x=L.MaxPooling2D(pool_size=(2,2))(x)
     x=L.Dropout(0.3)(x)
-    new_shape=((256//4),(64//4)*128)
+    new_shape=((128//4),(32//4)*128)
     x=L.Reshape(new_shape)(x)
     x=L.Dense(64,activation='relu')(x)
     x=L.Dropout(0.2)(x)
@@ -169,51 +178,86 @@ def make_model():
 model=make_model()
 model.summary()
 
-es = keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
-if 'prediction_model_ocr' not in os.listdir('./'):
+es = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+if 'prediction_model_ocr.h5' not in os.listdir('./'):
     history = model.fit(train_generator,
                         steps_per_epoch=len(train_generator),
                         validation_data=val_generator,
                         epochs=8)
 
-prediction_model = M.Model(model.get_layer.input[0],
-                            model.get_layer(name='Dense_output').output)
+prediction_model = tf.keras.models.Model(model.input[0],
+                                    model.get_layer(name='Dense_output').output)
 prediction_model.summary()
 
-if 'prediction_model_ocr' not in os.listdir('./'):
-    prediction_model.save('prediction_model_ocr')
-    prediction_model = M.load_model('prediction_model_ocr', compile=False)
+if 'prediction_model_ocr.h5' not in os.listdir('./'):
+    prediction_model.save('prediction_model_ocr.h5')
+    prediction_model = tf.keras.models.load_model('prediction_model_ocr.h5', compile=False)
 
 label_to_char[100] = ''
-def decode_prediction(pred):
-    input_len = np.ones(pred.shape[0]) * pred.shape[1]
-    results = tf.keras.backend.ctc_decode(pred, input_length=input_len, greedy=True)[0][0]
+def decode_batch_predictions(pred):
+    pred = pred[:, :-2]
+    input_len = np.ones(pred.shape[0])*pred.shape[1]
+    
+    # Use greedy search. For complex tasks, you can use beam search
+    results = tf.keras.backend.ctc_decode(pred, 
+                                        input_length=input_len,
+                                        greedy=True)[0][0]
+    
+    # Iterate over the results and get back the text
     output_text = []
-    for res in results:
-        res = tf.gather_nd(res, tf.where(tf.math.not_equal(res, -1)))
-        res = tf.gather_nd(res, tf.where(tf.math.not_equal(res, 100)))
-        text = ''.join([label_to_char[int(i)] for i in res])
-        output_text.append(text)
+    for res in results.numpy():
+        outstr = ''
+        for c in res:
+            if c < len(characters) and c >=0:
+                outstr += label_to_char[c]
+        output_text.append(outstr)
+    
+    # return final text results
     return output_text
 
 for p, (inp_value, _) in enumerate(val_generator):
     bs = inp_value['input_data'].shape[0]
     X_data = inp_value['input_data']
     labels = inp_value['input_label']
-    plt.imshow(X_data[0].squeeze(), cmap='gray')
+    plt.imshow(X_data[0].squeeze().T, cmap='gray')
     preds = prediction_model.predict(X_data)
-    pred_texts = decode_prediction(preds)
+    pred_texts = decode_batch_predictions(preds)
     
     
     orig_texts = []
     for label in labels:
         text = ''.join([label_to_char[int(x)] for x in label])
         orig_texts.append(text)
-        
-    for i in range(bs):
-        print(f'Ground truth: {orig_texts[i]} \t Predicted: {pred_texts[i]}')
-    break
+    with open('predictions.txt', 'w') as f:    
+        for i in range(bs):
+            print(f'Ground truth: {orig_texts[i]} \t Predicted: {pred_texts[i]}')
+            f.write(f'Ground truth: {orig_texts[i]} \t Predicted: {pred_texts[i]}\n')
+        break
+    
+test_path = r"C:\Users\Yen's PC\Downloads\Handwriting Recognition\test_v2\test"
 
+# lấy danh sách ảnh
+test_images = os.listdir(test_path)
+
+# chọn random 1 ảnh
+random_image = random.choice(test_images)
+
+# tạo batch
+batch_images = np.ones((1,128,32,1))
+img_path = os.path.join(test_path, random_image)
+img = cv2.imread(img_path)
+img=cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+img=cv2.resize(img,(128,32))
+img=(img/255).astype(np.float32)
+img=img.T
+img=np.expand_dims(img,axis=-1)
+batch_images[0]=img
+x=prediction_model.predict(batch_images)
+pred_texts = decode_batch_predictions(x)
+pred_texts = pred_texts[0]
+im=cv2.imread(img_path)
+plt.imshow(im)
+print('Predicted Text:',pred_texts)
 def calculate_wer(pred_texts, orig_texts):
     total_wer = 0
     for pred, orig in zip(pred_texts, orig_texts):
@@ -235,7 +279,7 @@ def evaluate_model(prediction_model, val_generator):
         labels = inp_value['input_label']
         
         preds = prediction_model.predict(X_data)
-        pred_texts = decode_prediction(preds)
+        pred_texts = decode_batch_predictions(preds)
         
         orig_texts = []
         for label in labels:
