@@ -46,7 +46,7 @@ train['Length']=train['IDENTITY'].apply(lambda x : len(str(x)))
 train=train[train['Length']<=16]
 train['IDENTITY']=train['IDENTITY'].str.upper()
 train[train['Length']==max(train['Length'])]
-train=train.sample(frac=0.8,random_state=42)
+train=train.sample(frac=0.6,random_state=42)
 val.dropna(inplace=True)
 val['Length'] = val['IDENTITY'].apply(lambda x: len(str(x)))
 val = val[val['Length'] <= 16]
@@ -89,7 +89,7 @@ class DataGenerator(Sequence):
         curr_batch_idx=self.indices[idx*self.batch_size:(idx+1)*self.batch_size]
         batch_images=np.ones((self.batch_size,self.width,self.height,1),dtype=np.float32)
         batch_labels=np.ones((self.batch_size,self.max_length),dtype=np.float32)
-        input_length=np.ones((self.batch_size,1),dtype=np.float32)*(self.width//self.downsample_factor-2)
+        input_length = np.ones((self.batch_size,1), dtype=np.int32) * ((self.width // self.downsample_factor) - 2)
         label_length=np.zeros((self.batch_size,1),dtype=np.int64)
         
         for i,idx in enumerate(curr_batch_idx):
@@ -147,48 +147,50 @@ class CTCLayer(L.Layer):
         return loss
     
 def make_model():
-    inp=L.Input(shape=(128,32,1),dtype=np.float32,name='input_data')
-    labels=L.Input(shape=[16],dtype=np.float32,name='input_label')
-    input_length=L.Input(shape=[1],dtype=np.int64,name='input_length')
-    label_length=L.Input(shape=[1],dtype=np.int64,name='label_length')
-    x=L.Conv2D(64,(3,3),activation='relu',padding='same',kernel_initializer='he_normal')(inp)
-    x=L.MaxPooling2D(pool_size=(2,2))(x)
-    x=L.Dropout(0.3)(x)
-    x=L.Conv2D(128,(3,3),activation='relu',padding='same',kernel_initializer='he_normal')(x)
-    x=L.MaxPooling2D(pool_size=(2,2))(x)
-    x=L.Dropout(0.3)(x)
-    new_shape=((128//4),(32//4)*128)
-    x=L.Reshape(new_shape)(x)
-    x=L.Dense(64,activation='relu')(x)
-    x=L.Dropout(0.2)(x)
-    x=L.Bidirectional(L.LSTM(128,return_sequences=True,dropout=0.2))(x)
-    x=L.Bidirectional(L.LSTM(64,return_sequences=True,dropout=0.25))(x)
-    x=L.Dense(len(characters)+1,activation='softmax',kernel_initializer='he_normal',name='Dense_output')(x)
-    output=CTCLayer(name='outputs')(labels,x,input_length,label_length)
-    model=M.Model([inp,labels,input_length,label_length],output)
-    # Optimizer
-    sgd = keras.optimizers.SGD(learning_rate=0.002,
-                               decay=1e-6,
-                               momentum=0.9,
-                               nesterov=True,
-                               clipnorm=5)
-    model.compile(optimizer=sgd)
+    inp = L.Input(shape=(128, 32, 1), dtype=np.float32, name='input_data')
+    labels = L.Input(shape=[16], dtype=np.float32, name='input_label')
+    input_length = L.Input(shape=[1], dtype=np.int64, name='input_length')
+    label_length = L.Input(shape=[1], dtype=np.int64, name='label_length')
+    
+    # CNN
+    x = L.Conv2D(32, (3, 3), activation='relu', padding='same')(inp)
+    x = L.MaxPooling2D(pool_size=(2, 2))(x)
+    x = L.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
+    x = L.MaxPooling2D(pool_size=(2, 2))(x)
+    
+    # Reshape: (batch, 32, 8, 64) → (batch, 32, 512)
+    x = L.Reshape((32, 512))(x)
+    
+    # RNN
+    x = L.Dense(256, activation='relu')(x)
+    x = L.Dropout(0.2)(x)
+    x = L.Bidirectional(L.LSTM(128, return_sequences=True))(x)
+    x = L.Dropout(0.2)(x)
+    x = L.Bidirectional(L.LSTM(64, return_sequences=True))(x)
+    
+    # Output
+    x = L.Dense(len(characters) + 1, activation='softmax')(x)
+    output = CTCLayer(name='outputs')(labels, x, input_length, label_length)
+    
+    model = M.Model([inp, labels, input_length, label_length], output)
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), loss={'outputs': lambda y_true, y_pred: y_pred})
     return model
-
 model=make_model()
 model.summary()
 
 es = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+print(os.listdir('./'))
 if 'prediction_model_ocr.h5' not in os.listdir('./'):
     history = model.fit(train_generator,
-                        steps_per_epoch=len(train_generator),
-                        validation_data=val_generator,
-                        epochs=8)
+                    steps_per_epoch=len(train_generator),
+                    validation_data=val_generator,
+                    epochs=10,
+                    callbacks=[es])  # ✅ Thêm early stopping
 
 prediction_model = tf.keras.models.Model(model.input[0],
-                                    model.get_layer(name='Dense_output').output)
+                                    model.get_layer(name='dense_1').output)
 prediction_model.summary()
-
+print(prediction_model.input)
 if 'prediction_model_ocr.h5' not in os.listdir('./'):
     prediction_model.save('prediction_model_ocr.h5')
     prediction_model = tf.keras.models.load_model('prediction_model_ocr.h5', compile=False)
