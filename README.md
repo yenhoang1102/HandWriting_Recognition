@@ -170,16 +170,17 @@ After training, the script will:
 ## Example Output
 
 ```
-Ground truth: JOHN      Predicted: JOHN
-Ground truth: DAVID     Predicted: DAVlD
-Ground truth: ALICE     Predicted: ALICE
+Ground truth: SARAMITO 	 Predicted: SARAMITO
+Ground truth: THEO 	 Predicted: THEO
+Ground truth: MORGANE 	 Predicted: MORGANE
+
 ```
 
 Evaluation metrics:
 
 ```
-Word Error Rate (WER): 0.21
-Character Error Rate (CER): 0.08
+Word Error Rate (WER): 0.2863
+Character Error Rate (CER): 0.0758
 ```
 
 ---
